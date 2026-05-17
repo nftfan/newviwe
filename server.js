@@ -10,22 +10,33 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// ---------- In-memory caches ----------
+// ============================================================
+// CACHE
+// ============================================================
+
 const metaCache = new Map();
-const META_TTL = 1000 * 60 * 60 * 12; // 12h
+const META_TTL = 1000 * 60 * 60 * 12;
 
 const feedCache = new Map();
-const FEED_TTL = 1000 * 60 * 5; // 5m
+const FEED_TTL = 1000 * 60 * 5;
+
+// ============================================================
+// HEADERS
+// ============================================================
 
 const BROWSER_HEADERS = {
   'User-Agent':
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+
   'Accept':
     'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+
   'Accept-Language': 'en-US,en;q=0.9'
 };
 
-// ---------- Helpers ----------
+// ============================================================
+// HELPERS
+// ============================================================
 
 function decodeEntities(s) {
   if (!s) return '';
@@ -48,42 +59,60 @@ function decodeEntities(s) {
 
 function stripTags(s) {
   if (!s) return '';
-  return decodeEntities(s.replace(/<[^>]+>/g, '')).trim();
+
+  return decodeEntities(
+    s.replace(/<[^>]+>/g, '')
+  ).trim();
 }
 
-// ---------- Resolve Google redirect ----------
+// ============================================================
+// GOOGLE REDIRECT RESOLVER
+// ============================================================
 
 async function resolveGoogleRedirect(googleUrl) {
   try {
     const res = await fetch(googleUrl, {
       headers: BROWSER_HEADERS,
       redirect: 'follow',
-      signal: AbortSignal.timeout(8000)
+      signal: AbortSignal.timeout(10000)
     });
 
-    if (res.url && !res.url.includes('news.google.com')) {
+    // Usually fetch resolves directly
+    if (
+      res.url &&
+      !res.url.includes('news.google.com')
+    ) {
       return res.url;
     }
 
     const html = await res.text();
 
-    const anchorMatch = html.match(
-      /<a[^>]+href="(https?:\/\/(?!news\.google\.com)[^"]+)"/i
+    // canonical
+    const canonical = html.match(
+      /<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/i
     );
 
-    if (anchorMatch) return anchorMatch[1];
+    if (canonical?.[1]) {
+      return canonical[1];
+    }
 
+    // Google redirect attr
     const dataMatch = html.match(
       /data-n-au="(https?:\/\/[^"]+)"/i
     );
 
-    if (dataMatch) return dataMatch[1];
+    if (dataMatch?.[1]) {
+      return dataMatch[1];
+    }
 
-    const jsUrlMatch = html.match(
-      /"(https?:\/\/(?!news\.google\.com|www\.google\.com)[^"]+)"/
+    // Generic href fallback
+    const hrefMatch = html.match(
+      /href="(https?:\/\/(?!news\.google\.com)[^"]+)"/i
     );
 
-    if (jsUrlMatch) return jsUrlMatch[1];
+    if (hrefMatch?.[1]) {
+      return hrefMatch[1];
+    }
 
     return googleUrl;
   } catch (err) {
@@ -92,30 +121,42 @@ async function resolveGoogleRedirect(googleUrl) {
   }
 }
 
-// ---------- Scrape page metadata ----------
+// ============================================================
+// META SCRAPER
+// ============================================================
 
 async function fetchPageMeta(url) {
   try {
     const res = await fetch(url, {
       headers: BROWSER_HEADERS,
       redirect: 'follow',
-      signal: AbortSignal.timeout(8000)
+      signal: AbortSignal.timeout(10000)
     });
 
-    if (!res.ok) return {};
+    if (!res.ok) {
+      console.warn('Meta fetch bad status:', res.status);
+      return {};
+    }
 
     const reader = res.body.getReader();
-    const decoder = new TextDecoder('utf-8', { fatal: false });
+
+    const decoder = new TextDecoder(
+      'utf-8',
+      { fatal: false }
+    );
 
     let html = '';
-    const MAX = 120 * 1024;
+
+    const MAX = 150 * 1024;
 
     while (html.length < MAX) {
       const { value, done } = await reader.read();
 
       if (done) break;
 
-      html += decoder.decode(value, { stream: true });
+      html += decoder.decode(value, {
+        stream: true
+      });
 
       if (html.includes('</head>')) break;
     }
@@ -129,23 +170,38 @@ async function fetchPageMeta(url) {
     const grab = (...patterns) => {
       for (const p of patterns) {
         const m = html.match(p);
-        if (m && m[1]) {
-          return decodeEntities(m[1].trim());
+
+        if (m?.[1]) {
+          return decodeEntities(
+            m[1].trim()
+          );
         }
       }
+
       return '';
     };
 
+    // ========================================================
+    // IMAGE EXTRACTION
+    // ========================================================
+
     const image = grab(
       /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i,
+
       /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i,
+
       /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i,
+
       /<meta[^>]+content=["']([^"']+)["'][^>]+name=["']twitter:image["']/i,
-      /<link[^>]+rel=["']image_src["'][^>]+href=["']([^"']+)["']/i
+
+      /<link[^>]+rel=["']image_src["'][^>]+href=["']([^"']+)["']/i,
+
+      /<img[^>]+src=["']([^"']+)["']/i
     );
 
     const description = grab(
       /<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']+)["']/i,
+
       /<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i
     );
 
@@ -159,9 +215,16 @@ async function fetchPageMeta(url) {
 
     let resolvedImage = image;
 
-    if (image && !image.startsWith('http')) {
+    // Resolve relative image URLs
+    if (
+      resolvedImage &&
+      !resolvedImage.startsWith('http')
+    ) {
       try {
-        resolvedImage = new URL(image, finalUrl).href;
+        resolvedImage = new URL(
+          resolvedImage,
+          finalUrl
+        ).href;
       } catch {}
     }
 
@@ -173,12 +236,18 @@ async function fetchPageMeta(url) {
       siteName
     };
   } catch (err) {
-    console.warn('Meta fetch failed:', err.message);
+    console.warn(
+      'Meta fetch failed:',
+      err.message
+    );
+
     return {};
   }
 }
 
-// ---------- Routes ----------
+// ============================================================
+// ROOT
+// ============================================================
 
 app.get('/', (req, res) => {
   res.json({
@@ -192,6 +261,10 @@ app.get('/', (req, res) => {
   });
 });
 
+// ============================================================
+// HEALTH
+// ============================================================
+
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
@@ -201,7 +274,9 @@ app.get('/health', (req, res) => {
   });
 });
 
-// ---------- Feed Route ----------
+// ============================================================
+// FEED
+// ============================================================
 
 app.get('/feed', async (req, res) => {
   const url = req.query.url;
@@ -212,9 +287,13 @@ app.get('/feed', async (req, res) => {
     });
   }
 
+  // cache
   const cached = feedCache.get(url);
 
-  if (cached && Date.now() - cached.t < FEED_TTL) {
+  if (
+    cached &&
+    Date.now() - cached.t < FEED_TTL
+  ) {
     return res.json({
       cached: true,
       items: cached.items
@@ -225,10 +304,13 @@ app.get('/feed', async (req, res) => {
     const r = await fetch(url, {
       headers: {
         ...BROWSER_HEADERS,
+
         'Accept':
-          'application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8'
+          'application/rss+xml, application/xml, text/xml;q=0.9,*/*;q=0.8'
       },
+
       redirect: 'follow',
+
       signal: AbortSignal.timeout(10000)
     });
 
@@ -242,22 +324,31 @@ app.get('/feed', async (req, res) => {
 
     const parsed = await parser.parseString(xml);
 
-    const items = (parsed.items || []).map(item => ({
-      title: stripTags(item.title || ''),
-      link: item.link || '',
-      pubDate: item.pubDate || '',
-      source:
-        item.creator ||
-        item.author ||
-        parsed.title ||
-        'News',
-      description: stripTags(
-        item.contentSnippet ||
-        item.content ||
-        item.summary ||
-        ''
-      )
-    }));
+    const items = (parsed.items || []).map(
+      item => ({
+        title: stripTags(
+          item.title || ''
+        ),
+
+        link: item.link || '',
+
+        pubDate:
+          item.pubDate || '',
+
+        source:
+          item.creator ||
+          item.author ||
+          parsed.title ||
+          'News',
+
+        description: stripTags(
+          item.contentSnippet ||
+            item.content ||
+            item.summary ||
+            ''
+        )
+      })
+    );
 
     feedCache.set(url, {
       t: Date.now(),
@@ -277,7 +368,9 @@ app.get('/feed', async (req, res) => {
   }
 });
 
-// ---------- Meta Route ----------
+// ============================================================
+// META
+// ============================================================
 
 app.get('/meta', async (req, res) => {
   const url = req.query.url;
@@ -288,9 +381,13 @@ app.get('/meta', async (req, res) => {
     });
   }
 
+  // cache
   const cached = metaCache.get(url);
 
-  if (cached && Date.now() - cached.t < META_TTL) {
+  if (
+    cached &&
+    Date.now() - cached.t < META_TTL
+  ) {
     return res.json({
       cached: true,
       ...cached.data
@@ -300,19 +397,33 @@ app.get('/meta', async (req, res) => {
   try {
     let targetUrl = url;
 
-    if (url.includes('news.google.com')) {
-      targetUrl = await resolveGoogleRedirect(url);
+    // Resolve Google News redirects
+    if (
+      url.includes('news.google.com')
+    ) {
+      targetUrl =
+        await resolveGoogleRedirect(url);
     }
 
-    const meta = await fetchPageMeta(targetUrl);
+    const meta =
+      await fetchPageMeta(targetUrl);
 
     const data = {
       originalUrl: url,
-      resolvedUrl: meta.finalUrl || targetUrl,
+
+      resolvedUrl:
+        meta.finalUrl || targetUrl,
+
       image: meta.image || '',
-      description: meta.description || '',
-      ogTitle: meta.ogTitle || '',
-      siteName: meta.siteName || ''
+
+      description:
+        meta.description || '',
+
+      ogTitle:
+        meta.ogTitle || '',
+
+      siteName:
+        meta.siteName || ''
     };
 
     metaCache.set(url, {
@@ -333,7 +444,9 @@ app.get('/meta', async (req, res) => {
   }
 });
 
-// ---------- Cache cleanup ----------
+// ============================================================
+// CACHE CLEANUP
+// ============================================================
 
 setInterval(() => {
   const now = Date.now();
@@ -351,8 +464,12 @@ setInterval(() => {
   }
 }, 1000 * 60 * 10);
 
-// ---------- Start ----------
+// ============================================================
+// START SERVER
+// ============================================================
 
 app.listen(PORT, () => {
-  console.log(`Dispatch server listening on :${PORT}`);
+  console.log(
+    `Dispatch server listening on :${PORT}`
+  );
 });
