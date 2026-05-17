@@ -1,33 +1,35 @@
 import express from 'express';
 import cors from 'cors';
+import Parser from 'rss-parser';
 
 const app = express();
+const parser = new Parser();
+
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json());
 
 // ---------- In-memory caches ----------
-// Article meta cache: resolves Google redirect + scrapes og:image
 const metaCache = new Map();
-const META_TTL = 1000 * 60 * 60 * 12; // 12 hours
+const META_TTL = 1000 * 60 * 60 * 12; // 12h
 
-// RSS feed cache (shorter — news changes)
 const feedCache = new Map();
-const FEED_TTL = 1000 * 60 * 5; // 5 minutes
+const FEED_TTL = 1000 * 60 * 5; // 5m
 
 const BROWSER_HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-  'Accept-Language': 'en-US,en;q=0.9',
-  'Accept-Encoding': 'gzip, deflate, br'
+  'User-Agent':
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Accept':
+    'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+  'Accept-Language': 'en-US,en;q=0.9'
 };
 
 // ---------- Helpers ----------
 
-// Strip HTML tags and decode entities for clean text
 function decodeEntities(s) {
   if (!s) return '';
+
   return s
     .replace(/&amp;/g, '&')
     .replace(/&lt;/g, '<')
@@ -36,8 +38,12 @@ function decodeEntities(s) {
     .replace(/&#039;/g, "'")
     .replace(/&apos;/g, "'")
     .replace(/&nbsp;/g, ' ')
-    .replace(/&#x([0-9a-fA-F]+);/g, (_, h) => String.fromCodePoint(parseInt(h, 16)))
-    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(parseInt(d, 10)));
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, h) =>
+      String.fromCodePoint(parseInt(h, 16))
+    )
+    .replace(/&#(\d+);/g, (_, d) =>
+      String.fromCodePoint(parseInt(d, 10))
+    );
 }
 
 function stripTags(s) {
@@ -45,52 +51,8 @@ function stripTags(s) {
   return decodeEntities(s.replace(/<[^>]+>/g, '')).trim();
 }
 
-// Parse Google News RSS XML manually (it's small + simple)
-function parseRSS(xml) {
-  const items = [];
-  const itemRegex = /<item>([\s\S]*?)<\/item>/g;
-  let match;
-  while ((match = itemRegex.exec(xml)) !== null) {
-    const block = match[1];
+// ---------- Resolve Google redirect ----------
 
-    const getTag = (tag) => {
-      const re = new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`, 'i');
-      const m = block.match(re);
-      if (!m) return '';
-      let v = m[1].trim();
-      // Strip CDATA
-      v = v.replace(/^<!\[CDATA\[([\s\S]*?)\]\]>$/, '$1').trim();
-      return v;
-    };
-
-    const rawTitle = getTag('title');
-    const link = getTag('link');
-    const pubDate = getTag('pubDate');
-    const description = getTag('description');
-    const sourceMatch = block.match(/<source[^>]*>([\s\S]*?)<\/source>/i);
-    const source = sourceMatch ? stripTags(sourceMatch[1]) : '';
-
-    // Title in Google News usually ends with " - Source Name"
-    let title = decodeEntities(rawTitle);
-    let extractedSource = source;
-    const dashMatch = title.match(/^(.+?)\s+-\s+([^-]+)$/);
-    if (dashMatch) {
-      title = dashMatch[1].trim();
-      if (!extractedSource) extractedSource = dashMatch[2].trim();
-    }
-
-    items.push({
-      title,
-      link,
-      pubDate,
-      source: extractedSource || 'News',
-      description: stripTags(description)
-    });
-  }
-  return items;
-}
-
-// Resolve Google News redirect to the real article URL
 async function resolveGoogleRedirect(googleUrl) {
   try {
     const res = await fetch(googleUrl, {
@@ -99,25 +61,28 @@ async function resolveGoogleRedirect(googleUrl) {
       signal: AbortSignal.timeout(8000)
     });
 
-    // If the redirect happened via HTTP, the final URL is the answer
     if (res.url && !res.url.includes('news.google.com')) {
       return res.url;
     }
 
-    // Otherwise Google uses JS-based redirect — parse the HTML for the real URL
     const html = await res.text();
 
-    // Look for the canonical link in the redirect interstitial
-    // Pattern 1: <a href="https://realsite.com/article">
-    const anchorMatch = html.match(/<a[^>]+href="(https?:\/\/(?!news\.google\.com)[^"]+)"/i);
+    const anchorMatch = html.match(
+      /<a[^>]+href="(https?:\/\/(?!news\.google\.com)[^"]+)"/i
+    );
+
     if (anchorMatch) return anchorMatch[1];
 
-    // Pattern 2: data-n-au="..." or similar Google attribute
-    const dataMatch = html.match(/data-n-au="(https?:\/\/[^"]+)"/i);
+    const dataMatch = html.match(
+      /data-n-au="(https?:\/\/[^"]+)"/i
+    );
+
     if (dataMatch) return dataMatch[1];
 
-    // Pattern 3: URL inside JS string
-    const jsUrlMatch = html.match(/"(https?:\/\/(?!news\.google\.com|www\.google\.com)[^"]+)"/);
+    const jsUrlMatch = html.match(
+      /"(https?:\/\/(?!news\.google\.com|www\.google\.com)[^"]+)"/
+    );
+
     if (jsUrlMatch) return jsUrlMatch[1];
 
     return googleUrl;
@@ -127,7 +92,8 @@ async function resolveGoogleRedirect(googleUrl) {
   }
 }
 
-// Scrape og:image, og:description, og:title from a destination page
+// ---------- Scrape page metadata ----------
+
 async function fetchPageMeta(url) {
   try {
     const res = await fetch(url, {
@@ -135,27 +101,37 @@ async function fetchPageMeta(url) {
       redirect: 'follow',
       signal: AbortSignal.timeout(8000)
     });
+
     if (!res.ok) return {};
 
-    // Only read first ~120KB — the <head> is always near the top
     const reader = res.body.getReader();
     const decoder = new TextDecoder('utf-8', { fatal: false });
+
     let html = '';
     const MAX = 120 * 1024;
+
     while (html.length < MAX) {
       const { value, done } = await reader.read();
+
       if (done) break;
+
       html += decoder.decode(value, { stream: true });
+
       if (html.includes('</head>')) break;
     }
-    try { reader.cancel(); } catch {}
+
+    try {
+      reader.cancel();
+    } catch {}
 
     const finalUrl = res.url || url;
 
     const grab = (...patterns) => {
       for (const p of patterns) {
         const m = html.match(p);
-        if (m && m[1]) return decodeEntities(m[1].trim());
+        if (m && m[1]) {
+          return decodeEntities(m[1].trim());
+        }
       }
       return '';
     };
@@ -181,8 +157,8 @@ async function fetchPageMeta(url) {
       /<meta[^>]+property=["']og:site_name["'][^>]+content=["']([^"']+)["']/i
     );
 
-    // Resolve relative image URLs
     let resolvedImage = image;
+
     if (image && !image.startsWith('http')) {
       try {
         resolvedImage = new URL(image, finalUrl).href;
@@ -208,7 +184,11 @@ app.get('/', (req, res) => {
   res.json({
     name: 'Dispatch Server',
     status: 'ok',
-    endpoints: ['/feed?url=<rss_url>', '/meta?url=<article_url>', '/health']
+    endpoints: [
+      '/feed?url=<rss_url>',
+      '/meta?url=<article_url>',
+      '/health'
+    ]
   });
 });
 
@@ -221,49 +201,111 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Fetch and parse an RSS feed
+// ---------- Feed Route ----------
+
 app.get('/feed', async (req, res) => {
   const url = req.query.url;
-  if (!url) return res.status(400).json({ error: 'Missing url param' });
 
-  // Cache check
+  if (!url) {
+    return res.status(400).json({
+      error: 'Missing url param'
+    });
+  }
+
   const cached = feedCache.get(url);
+
   if (cached && Date.now() - cached.t < FEED_TTL) {
-    return res.json({ cached: true, items: cached.items });
+    return res.json({
+      cached: true,
+      items: cached.items
+    });
   }
 
   try {
-    const r = await fetch(url, { headers: BROWSER_HEADERS, signal: AbortSignal.timeout(10000) });
+    const r = await fetch(url, {
+      headers: {
+        ...BROWSER_HEADERS,
+        'Accept':
+          'application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8'
+      },
+      redirect: 'follow',
+      signal: AbortSignal.timeout(10000)
+    });
+
     if (!r.ok) {
-      return res.status(502).json({ error: `Feed returned ${r.status}` });
+      return res.status(502).json({
+        error: `Feed returned ${r.status}`
+      });
     }
+
     const xml = await r.text();
-    const items = parseRSS(xml);
-    feedCache.set(url, { t: Date.now(), items });
-    res.json({ cached: false, items });
+
+    const parsed = await parser.parseString(xml);
+
+    const items = (parsed.items || []).map(item => ({
+      title: stripTags(item.title || ''),
+      link: item.link || '',
+      pubDate: item.pubDate || '',
+      source:
+        item.creator ||
+        item.author ||
+        parsed.title ||
+        'News',
+      description: stripTags(
+        item.contentSnippet ||
+        item.content ||
+        item.summary ||
+        ''
+      )
+    }));
+
+    feedCache.set(url, {
+      t: Date.now(),
+      items
+    });
+
+    res.json({
+      cached: false,
+      items
+    });
   } catch (err) {
-    console.error('Feed error:', err.message);
-    res.status(500).json({ error: err.message });
+    console.error('Feed error:', err);
+
+    res.status(500).json({
+      error: err.message
+    });
   }
 });
 
-// Resolve + scrape meta for an article URL
+// ---------- Meta Route ----------
+
 app.get('/meta', async (req, res) => {
   const url = req.query.url;
-  if (!url) return res.status(400).json({ error: 'Missing url param' });
 
-  // Cache check
+  if (!url) {
+    return res.status(400).json({
+      error: 'Missing url param'
+    });
+  }
+
   const cached = metaCache.get(url);
+
   if (cached && Date.now() - cached.t < META_TTL) {
-    return res.json({ cached: true, ...cached.data });
+    return res.json({
+      cached: true,
+      ...cached.data
+    });
   }
 
   try {
     let targetUrl = url;
+
     if (url.includes('news.google.com')) {
       targetUrl = await resolveGoogleRedirect(url);
     }
+
     const meta = await fetchPageMeta(targetUrl);
+
     const data = {
       originalUrl: url,
       resolvedUrl: meta.finalUrl || targetUrl,
@@ -272,24 +314,44 @@ app.get('/meta', async (req, res) => {
       ogTitle: meta.ogTitle || '',
       siteName: meta.siteName || ''
     };
-    metaCache.set(url, { t: Date.now(), data });
-    res.json({ cached: false, ...data });
+
+    metaCache.set(url, {
+      t: Date.now(),
+      data
+    });
+
+    res.json({
+      cached: false,
+      ...data
+    });
   } catch (err) {
-    console.error('Meta error:', err.message);
-    res.status(500).json({ error: err.message });
+    console.error('Meta error:', err);
+
+    res.status(500).json({
+      error: err.message
+    });
   }
 });
 
-// ---------- Cache eviction ----------
+// ---------- Cache cleanup ----------
+
 setInterval(() => {
   const now = Date.now();
+
   for (const [k, v] of metaCache.entries()) {
-    if (now - v.t > META_TTL) metaCache.delete(k);
+    if (now - v.t > META_TTL) {
+      metaCache.delete(k);
+    }
   }
+
   for (const [k, v] of feedCache.entries()) {
-    if (now - v.t > FEED_TTL) feedCache.delete(k);
+    if (now - v.t > FEED_TTL) {
+      feedCache.delete(k);
+    }
   }
 }, 1000 * 60 * 10);
+
+// ---------- Start ----------
 
 app.listen(PORT, () => {
   console.log(`Dispatch server listening on :${PORT}`);
