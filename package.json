@@ -1,0 +1,17 @@
+{
+  "name": "dispatch-server",
+  "version": "1.0.0",
+  "description": "RSS proxy + OG image resolver for Dispatch news app",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "cors": "^2.8.5"
+  }
+}
